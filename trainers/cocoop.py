@@ -1,6 +1,7 @@
 import os.path as osp
-import os
-import time
+from collections import OrderedDict
+import math
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -13,21 +14,6 @@ from dassl.optim import build_optimizer, build_lr_scheduler
 
 from clip import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
-
-from dassl.data import DataManager
-from dassl.optim import build_optimizer, build_lr_scheduler
-from dassl.utils import (
-    MetricMeter, AverageMeter, tolist_if_not, count_num_param, load_checkpoint,
-    save_checkpoint, mkdir_if_missing, resume_from_checkpoint,
-    load_pretrained_weights
-)
-
-from sampling import mnist_iid, mnist_noniid, mnist_noniid_unequal
-from sampling import cifar_iid, cifar_noniid
-
-
-
-
 
 _tokenizer = _Tokenizer()
 
@@ -77,10 +63,11 @@ class PromptLearner(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
         n_cls = len(classnames)
-        n_ctx = cfg.TRAINER.PROMPTFL.N_CTX
-        ctx_init = cfg.TRAINER.PROMPTFL.CTX_INIT
+        n_ctx = cfg.TRAINER.COCOOP.N_CTX
+        ctx_init = cfg.TRAINER.COCOOP.CTX_INIT
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
+        vis_dim = clip_model.visual.output_dim
         clip_imsize = clip_model.visual.input_resolution
         cfg_imsize = cfg.INPUT.SIZE[0]
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
@@ -92,30 +79,33 @@ class PromptLearner(nn.Module):
             prompt = clip.tokenize(ctx_init)
             with torch.no_grad():
                 embedding = clip_model.token_embedding(prompt).type(dtype)
-            ctx_vectors = embedding[0, 1: 1 + n_ctx, :]
+            ctx_vectors = embedding[0, 1 : 1 + n_ctx, :]
             prompt_prefix = ctx_init
-
         else:
             # random initialization
-            if cfg.TRAINER.PROMPTFL.CSC:
-                print("Initializing class-specific contexts")
-                ctx_vectors = torch.empty(n_cls, n_ctx, ctx_dim, dtype=dtype)
-            else:
-                print("Initializing a generic context")
-                ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
+            ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
             nn.init.normal_(ctx_vectors, std=0.02)
             prompt_prefix = " ".join(["X"] * n_ctx)
 
         print(f'Initial context: "{prompt_prefix}"')
         print(f"Number of context words (tokens): {n_ctx}")
 
-        self.ctx = nn.Parameter(ctx_vectors)  # to be optimized
+        self.ctx = nn.Parameter(ctx_vectors)
+
+        self.meta_net = nn.Sequential(OrderedDict([
+            ("linear1", nn.Linear(vis_dim, vis_dim // 16)),
+            ("relu", nn.ReLU(inplace=True)),
+            ("linear2", nn.Linear(vis_dim // 16, ctx_dim))
+        ]))
+        
+        if cfg.TRAINER.COCOOP.PREC == "fp16":
+            self.meta_net.half()
 
         classnames = [name.replace("_", " ") for name in classnames]
         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
         prompts = [prompt_prefix + " " + name + "." for name in classnames]
 
-        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
+        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])  # (n_cls, n_tkn)
         with torch.no_grad():
             embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
 
@@ -123,78 +113,51 @@ class PromptLearner(nn.Module):
         # but they should be ignored in load_model() as we want to use
         # those computed using the current class names
         self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
-        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])  # CLS, EOS
+        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx :, :])  # CLS, EOS
 
         self.n_cls = n_cls
         self.n_ctx = n_ctx
         self.tokenized_prompts = tokenized_prompts  # torch.Tensor
         self.name_lens = name_lens
-        self.class_token_position = cfg.TRAINER.PROMPTFL.CLASS_TOKEN_POSITION
+    
+    def construct_prompts(self, ctx, prefix, suffix, label=None):
+        # dim0 is either batch_size (during training) or n_cls (during testing)
+        # ctx: context tokens, with shape of (dim0, n_ctx, ctx_dim)
+        # prefix: the sos token, with shape of (n_cls, 1, ctx_dim)
+        # suffix: remaining tokens, with shape of (n_cls, *, ctx_dim)
 
-    def forward(self):
-        ctx = self.ctx
-        if ctx.dim() == 2:
-            ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
+        if label is not None:
+            prefix = prefix[label]
+            suffix = suffix[label]
 
+        prompts = torch.cat(
+            [
+                prefix,  # (dim0, 1, dim)
+                ctx,     # (dim0, n_ctx, dim)
+                suffix,  # (dim0, *, dim)
+            ],
+            dim=1,
+        )
+
+        return prompts
+
+    def forward(self, im_features):
         prefix = self.token_prefix
         suffix = self.token_suffix
-
-        if self.class_token_position == "end":
-            prompts = torch.cat(
-                [
-                    prefix,  # (n_cls, 1, dim)
-                    ctx,  # (n_cls, n_ctx, dim)
-                    suffix,  # (n_cls, *, dim)
-                ],
-                dim=1,
-            )
-
-        elif self.class_token_position == "middle":
-            half_n_ctx = self.n_ctx // 2
-            prompts = []
-            for i in range(self.n_cls):
-                name_len = self.name_lens[i]
-                prefix_i = prefix[i: i + 1, :, :]
-                class_i = suffix[i: i + 1, :name_len, :]
-                suffix_i = suffix[i: i + 1, name_len:, :]
-                ctx_i_half1 = ctx[i: i + 1, :half_n_ctx, :]
-                ctx_i_half2 = ctx[i: i + 1, half_n_ctx:, :]
-                prompt = torch.cat(
-                    [
-                        prefix_i,  # (1, 1, dim)
-                        ctx_i_half1,  # (1, n_ctx//2, dim)
-                        class_i,  # (1, name_len, dim)
-                        ctx_i_half2,  # (1, n_ctx//2, dim)
-                        suffix_i,  # (1, *, dim)
-                    ],
-                    dim=1,
-                )
-                prompts.append(prompt)
-            prompts = torch.cat(prompts, dim=0)
-
-        elif self.class_token_position == "front":
-            prompts = []
-            for i in range(self.n_cls):
-                name_len = self.name_lens[i]
-                prefix_i = prefix[i: i + 1, :, :]
-                class_i = suffix[i: i + 1, :name_len, :]
-                suffix_i = suffix[i: i + 1, name_len:, :]
-                ctx_i = ctx[i: i + 1, :, :]
-                prompt = torch.cat(
-                    [
-                        prefix_i,  # (1, 1, dim)
-                        class_i,  # (1, name_len, dim)
-                        ctx_i,  # (1, n_ctx, dim)
-                        suffix_i,  # (1, *, dim)
-                    ],
-                    dim=1,
-                )
-                prompts.append(prompt)
-            prompts = torch.cat(prompts, dim=0)
-
-        else:
-            raise ValueError
-
+        ctx = self.ctx                     # (n_ctx, ctx_dim)
+        bias = self.meta_net(im_features)  # (batch, ctx_dim)
+        bias = bias.unsqueeze(1)           # (batch, 1, ctx_dim)
+        ctx = ctx.unsqueeze(0)             # (1, n_ctx, ctx_dim)
+        ctx_shifted = ctx + bias           # (batch, n_ctx, ctx_dim)
+        
+        # Use instance-conditioned context tokens for all classes
+        prompts = []
+        for ctx_shifted_i in ctx_shifted:
+            ctx_i = ctx_shifted_i.unsqueeze(0).expand(self.n_cls, -1, -1)
+            pts_i = self.construct_prompts(ctx_i, prefix, suffix)  # (n_cls, n_tkn, ctx_dim)
+            prompts.append(pts_i)
+        prompts = torch.stack(prompts)
+        
         return prompts
 
 
@@ -208,40 +171,42 @@ class CustomCLIP(nn.Module):
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
-    def forward(self, image):
-        image_features = self.image_encoder(image.type(self.dtype))
-
-        prompts = self.prompt_learner()
+    def forward(self, image, label=None):
         tokenized_prompts = self.tokenized_prompts
-        text_features = self.text_encoder(prompts, tokenized_prompts)
-
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-
         logit_scale = self.logit_scale.exp()
-        logits = logit_scale * image_features @ text_features.t()
 
+        image_features = self.image_encoder(image.type(self.dtype))
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+        prompts = self.prompt_learner(image_features)
+        
+        logits = []
+        for pts_i, imf_i in zip(prompts, image_features):
+            text_features = self.text_encoder(pts_i, tokenized_prompts)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            l_i = logit_scale * imf_i @ text_features.t()
+            logits.append(l_i)
+        logits = torch.stack(logits)
+        
+        if self.prompt_learner.training:
+            return F.cross_entropy(logits, label)
+        
         return logits
 
 
-
 @TRAINER_REGISTRY.register()
-class PromptFL(TrainerX):
-
+class CoCoOp(TrainerX):
     def check_cfg(self, cfg):
-        assert cfg.TRAINER.PROMPTFL.PREC in ["fp16", "fp32", "amp"]
-
-
+        assert cfg.TRAINER.COCOOP.PREC in ["fp16", "fp32", "amp"]
 
     def build_model(self):
         cfg = self.cfg
         classnames = self.dm.dataset.classnames
-        print(self.dm.dataset)
 
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
-
-        if cfg.TRAINER.PROMPTFL.PREC == "fp32" or cfg.TRAINER.PROMPTFL.PREC == "amp":
+        
+        if cfg.TRAINER.COCOOP.PREC == "fp32" or cfg.TRAINER.COCOOP.PREC == "amp":
             # CLIP's default precision is fp16
             clip_model.float()
 
@@ -249,13 +214,18 @@ class PromptFL(TrainerX):
         self.model = CustomCLIP(cfg, classnames, clip_model)
 
         print("Turning off gradients in both the image and the text encoder")
+        name_to_update = "prompt_learner"
+        
         for name, param in self.model.named_parameters():
-            # print(name,":",param.size())
-            if "prompt_learner" not in name:
+            if name_to_update not in name:
                 param.requires_grad_(False)
-        print(f"# params: {count_num_param(self.model):,}")
-        print(f"# prompt learner params: {count_num_param(self.model.prompt_learner):,}")
-
+        
+        # Double check
+        enabled = set()
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                enabled.add(name)
+        print(f"Parameters to be updated: {enabled}")
 
         if cfg.MODEL.INIT_WEIGHTS:
             load_pretrained_weights(self.model.prompt_learner, cfg.MODEL.INIT_WEIGHTS)
@@ -266,36 +236,37 @@ class PromptFL(TrainerX):
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         self.register_model("prompt_learner", self.model.prompt_learner, self.optim, self.sched)
 
-        self.scaler = GradScaler() if cfg.TRAINER.PROMPTFL.PREC == "amp" else None
+        self.scaler = GradScaler() if cfg.TRAINER.COCOOP.PREC == "amp" else None
 
         # Note that multi-gpu training could be slow because CLIP's size is
         # big, which slows down the copy operation in DataParallel
-        os.environ["CUDA_VISIBLE_DEVICES"] = "1,0"
         device_count = torch.cuda.device_count()
         if device_count > 1:
             print(f"Multiple GPUs detected (n_gpus={device_count}), use all of them!")
-            # self.model = nn.DataParallel(self.model, device_ids=[1])
+            self.model = nn.DataParallel(self.model)
 
     def forward_backward(self, batch):
         image, label = self.parse_batch_train(batch)
-        prec = self.cfg.TRAINER.PROMPTFL.PREC
+
+        model = self.model
+        optim = self.optim
+        scaler = self.scaler
+        
+        prec = self.cfg.TRAINER.COCOOP.PREC
         if prec == "amp":
             with autocast():
-                output = self.model(image)
-                loss = F.cross_entropy(output, label)
-            self.optim.zero_grad()
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optim)
-            self.scaler.update()
+                loss = model(image, label)
+            optim.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.step(optim)
+            scaler.update()
         else:
-            output = self.model(image)
-            loss = F.cross_entropy(output, label)
-            self.model_backward_and_update(loss)
+            loss = model(image, label)
+            optim.zero_grad()
+            loss.backward()
+            optim.step()
 
-        loss_summary = {
-            "loss": loss.item(),
-            "acc": compute_accuracy(output, label)[0].item(),
-        }
+        loss_summary = {"loss": loss.item()}
 
         if (self.batch_idx + 1) == self.num_batches:
             self.update_lr()
@@ -326,7 +297,7 @@ class PromptFL(TrainerX):
             model_path = osp.join(directory, name, model_file)
 
             if not osp.exists(model_path):
-                raise FileNotFoundError('Model bash main.sh caltech101 rn50_ep50 end 16 1 Falsenot found at "{}"'.format(model_path))
+                raise FileNotFoundError('Model not found at "{}"'.format(model_path))
 
             checkpoint = load_checkpoint(model_path)
             state_dict = checkpoint["state_dict"]
@@ -342,33 +313,3 @@ class PromptFL(TrainerX):
             print("Loading weights to {} " 'from "{}" (epoch = {})'.format(name, model_path, epoch))
             # set strict=False
             self._models[name].load_state_dict(state_dict, strict=False)
-
-@TRAINER_REGISTRY.register()
-class Baseline(TrainerX):
-    """Supervised Baseline."""
-
-    def forward_backward(self, batch):
-        input, label = self.parse_batch_train(batch)
-        output = self.model(input)
-        loss = F.cross_entropy(output, label)
-        self.model_backward_and_update(loss)
-
-        loss_summary = {
-            "loss": loss.item(),
-            "acc": compute_accuracy(output, label)[0].item(),
-        }
-
-        if (self.batch_idx + 1) == self.num_batches:
-            self.update_lr()
-
-        return loss_summary
-
-    def parse_batch_train(self, batch):
-        input = batch["img"]
-        label = batch["label"]
-        input = input.to(self.device)
-        label = label.to(self.device)
-        return input, label
-
-
-
