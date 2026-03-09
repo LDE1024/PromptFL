@@ -11,10 +11,10 @@ import copy
 import numpy as np
 from tqdm import tqdm
 
-from utils import get_dataset, average_weights, exp_details,count_parameters
+from utils import get_dataset, average_weights, exp_details, count_parameters
 from draw import visualize
 
-# datasets
+# custom datasets
 import datasets.oxford_pets
 import datasets.oxford_flowers
 import datasets.fgvc_aircraft
@@ -22,13 +22,11 @@ import datasets.dtd
 import datasets.food101
 import datasets.caltech101
 
-# trainers
+# custom trainers
 import trainers.coop
 import trainers.cocoop
 import trainers.zsclip
 import trainers.promptfl
-
-
 
 
 def print_args(args, cfg):
@@ -74,64 +72,66 @@ def reset_cfg(cfg, args):
 def extend_cfg(cfg):
     """
     Add new config variables.
-
-    E.g.
-        from yacs.config import CfgNode as CN
-        cfg.TRAINER.MY_MODEL = CN()
-        cfg.TRAINER.MY_MODEL.PARAM_A = 1.
-        cfg.TRAINER.MY_MODEL.PARAM_B = 0.5
-        cfg.TRAINER.MY_MODEL.PARAM_C = False
     """
     from yacs.config import CfgNode as CN
 
+    # PromptFL config
     cfg.TRAINER.PROMPTFL = CN()
-    cfg.TRAINER.PROMPTFL.N_CTX = 16  # number of context vectors
-    cfg.TRAINER.PROMPTFL.CSC = False  # class-specific context
-    cfg.TRAINER.PROMPTFL.CTX_INIT = ""  # initialization words
-    cfg.TRAINER.PROMPTFL.PREC = "fp16"  # fp16, fp32, amp
-    cfg.TRAINER.PROMPTFL.CLASS_TOKEN_POSITION = "end"  # 'middle' or 'end' or 'front'
+    cfg.TRAINER.PROMPTFL.N_CTX = 16
+    cfg.TRAINER.PROMPTFL.CSC = False
+    cfg.TRAINER.PROMPTFL.CTX_INIT = ""
+    cfg.TRAINER.PROMPTFL.PREC = "fp16"
+    cfg.TRAINER.PROMPTFL.CLASS_TOKEN_POSITION = "end"
 
-
-    cfg.DATASET.SUBSAMPLE_CLASSES = "all"  # all, base or new
-    cfg.DATASET.USERS = 2  # number of clients
-    cfg.DATASET.IID = False  # is iid
-    cfg.DATASET.USEALL = False # use all data for training instead of few shot
-    cfg.DATASET.REPEATRATE = 0.0 # repeat rate on each client
-    cfg.OPTIM.ROUND = 10 # global round
-    cfg.OPTIM.MAX_EPOCH = 5 # local epoch
+    # dataset / FL config
+    cfg.DATASET.SUBSAMPLE_CLASSES = "all"
+    cfg.DATASET.USERS = 2
+    cfg.DATASET.IID = False
+    cfg.DATASET.USEALL = False
+    cfg.DATASET.REPEATRATE = 0.0
+    cfg.OPTIM.ROUND = 10
+    cfg.OPTIM.MAX_EPOCH = 5
 
     cfg.MODEL.BACKBONE.PRETRAINED = True
+
+    # attack config
+    cfg.ATTACK = CN()
+    cfg.ATTACK.ENABLE = False
+    cfg.ATTACK.ATTACKER_ID = 0
+    cfg.ATTACK.TARGET_LABEL = 0
+    cfg.ATTACK.POISON_RATIO = 0.4
+    cfg.ATTACK.LAMBDA = 1.0
+    cfg.ATTACK.EPS = 8.0 / 255.0
 
 
 def setup_cfg(args):
     cfg = get_cfg_default()
     extend_cfg(cfg)
 
-    # 1. From the dataset config file
+    # 1. dataset config
     if args.dataset_config_file:
         cfg.merge_from_file(args.dataset_config_file)
 
-    # 2. From the method config file
+    # 2. method config
     if args.config_file:
         cfg.merge_from_file(args.config_file)
 
-    # 3. From input arguments
+    # 3. command line args
     reset_cfg(cfg, args)
 
-    # 4. From optional input arguments
+    # 4. extra opts
     cfg.merge_from_list(args.opts)
 
     cfg.freeze()
-
     return cfg
-
 
 
 def main(args):
     cfg = setup_cfg(args)
+
     if cfg.SEED >= 0:
-        # print("Setting fixed seed: {}".format(cfg.SEED))
         set_random_seed(cfg.SEED)
+
     setup_logger(cfg.OUTPUT_DIR)
 
     if torch.cuda.is_available() and cfg.USE_CUDA:
@@ -142,74 +142,111 @@ def main(args):
     # print("** System info **\n{}\n".format(collect_env_info()))
 
     global_trainer = build_trainer(cfg)
-    print("type",type(global_trainer))
-    # count_parameters(global_trainer.model,"prompt_learner")
-    # count_parameters(global_trainer.model, "image_encoder")
-    # count_parameters(global_trainer.model, "text_encoder")
+    print("type", type(global_trainer))
     global_trainer.fed_before_train(is_global=True)
 
-    # copy weights
+    # global weights
     global_weights = global_trainer.model.state_dict()
-    local_weights, local_losses = [], []
 
+    # local trainer
     local_trainer = build_trainer(cfg)
     local_trainer.fed_before_train()
 
-    # Training
     start_epoch = 0
     max_epoch = cfg.OPTIM.ROUND
-    # global_trainer.before_train()
+
     global_test_acc_list = []
     global_test_error_list = []
     global_test_f1_list = []
     global_epoch_list = []
     global_time_list = []
+    global_asr_list = []
+
     start = time.time()
+
     for epoch in range(start_epoch, max_epoch):
-        # m = max(int(args.frac * args.num_users), 1)
-        # idxs_users = np.random.choice(range(args.num_users), m, replace=False)
-        idxs_users = list(range(0,cfg.DATASET.USERS))
-        print("idxs_users",idxs_users)
-        print("------------local train start epoch:",epoch,"-------------")
+        local_weights = []
+
+        idxs_users = list(range(0, cfg.DATASET.USERS))
+        print("idxs_users", idxs_users)
+        print("------------local train start epoch:", epoch, "-------------")
+
         for idx in idxs_users:
             local_trainer.model.load_state_dict(global_weights)
-            local_trainer.train(idx=idx,global_epoch=epoch,is_fed=True)
+
+            # default: no attack
+            local_trainer.attack_enable = cfg.ATTACK.ENABLE
+            local_trainer.is_malicious = False
+
+            # set attack params for malicious client
+            if cfg.ATTACK.ENABLE and idx == cfg.ATTACK.ATTACKER_ID:
+                print(f"[!!!] Client {idx} is executing route-A backdoor attack")
+                local_trainer.is_malicious = True
+                local_trainer.poison_ratio = cfg.ATTACK.POISON_RATIO
+                local_trainer.target_label = cfg.ATTACK.TARGET_LABEL
+                local_trainer.attack_lambda = cfg.ATTACK.LAMBDA
+                local_trainer.eps = cfg.ATTACK.EPS
+
+            print(
+                f"[CLIENT {idx}] attack_enable={local_trainer.attack_enable}, "
+                f"is_malicious={local_trainer.is_malicious}"
+            )
+
+            local_trainer.train(idx=idx, global_epoch=epoch, is_fed=True)
+
             local_weight = local_trainer.model.state_dict()
-            local_weights.append(local_weight)
-        print("------------local train finish epoch:",epoch,"-------------")
+            local_weights.append(copy.deepcopy(local_weight))
 
-        # update global weights
+        print("------------local train finish epoch:", epoch, "-------------")
+
+        # aggregate
         global_weights = average_weights(local_weights)
-
-        # update global weights
         global_trainer.model.load_state_dict(global_weights)
 
-        # Calculate avg training accuracy over all users at every epoch
         print("------------global test start-------------")
         result = global_trainer.test(is_global=True, current_epoch=epoch)
+
         global_test_acc_list.append(result[0])
         global_test_error_list.append(result[1])
         global_test_f1_list.append(result[2])
         global_epoch_list.append(epoch)
-        global_time_list.append(time.time()-start)
+        global_time_list.append(time.time() - start)
+
+        if cfg.ATTACK.ENABLE:
+            asr_score = global_trainer.test_asr()
+            global_asr_list.append(asr_score)
+            print(
+                f"-> Global Round: {epoch} | Main Accuracy: {result[0]:.2f}% "
+                f"| ASR: {asr_score:.2f}%"
+            )
+        else:
+            print(f"-> Global Round: {epoch} | Main Accuracy: {result[0]:.2f}%")
+
         print("------------global test finish-------------")
-        # print("------------local test start-------------")
-        # for c in range(args.num_users):
-        #     local_trainer.model.load_state_dict(global_weights)
-        #     local_trainer.test()
-        # print("------------local test finish-------------")
-        print("Epoch on server :", epoch)
+
     local_trainer.fed_after_train()
     global_trainer.fed_after_train()
-    visualize(global_test_acc_list, global_test_error_list, global_test_f1_list, global_epoch_list, global_time_list, cfg.OUTPUT_DIR)
 
-
-
-
-
-
-
-
+    # visualize
+    if cfg.ATTACK.ENABLE:
+        visualize(
+            global_test_acc_list,
+            global_test_error_list,
+            global_test_f1_list,
+            global_epoch_list,
+            global_time_list,
+            cfg.OUTPUT_DIR,
+            asr_list=global_asr_list,
+        )
+    else:
+        visualize(
+            global_test_acc_list,
+            global_test_error_list,
+            global_test_f1_list,
+            global_epoch_list,
+            global_time_list,
+            cfg.OUTPUT_DIR,
+        )
 
 
 if __name__ == "__main__":
@@ -259,14 +296,6 @@ if __name__ == "__main__":
         nargs=argparse.REMAINDER,
         help="modify config options using the command-line",
     )
-    # parser.add_argument('--num_users', type=int, default=2, help="number of users: K")
-    # parser.add_argument('--frac', type=float, default=1.0, help='the fraction of clients: C')
+
     args = parser.parse_args()
     main(args)
-
-
-
-
-
-
-
