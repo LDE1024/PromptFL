@@ -7,7 +7,7 @@ from dassl.utils import listdir_nohidden, mkdir_if_missing
 
 from .oxford_pets import OxfordPets
 
-
+from collections import defaultdict
 @DATASET_REGISTRY.register()
 class DescribableTextures(DatasetBase):
 
@@ -49,7 +49,8 @@ class DescribableTextures(DatasetBase):
                 print(f"Saving preprocessed few-shot data to {preprocessed}")
                 #with open(preprocessed, "wb") as file:
                 #   pickle.dump(data, file, protocol=pickle.HIGHEST_PROTOCOL)
-
+        if num_shots < 1:
+            train = total_train
         subsample = cfg.DATASET.SUBSAMPLE_CLASSES
         train, val, test = OxfordPets.subsample_classes(train, val, test, subsample=subsample)
         if cfg.DATASET.USERS > 0 and cfg.DATASET.USEALL:
@@ -61,8 +62,12 @@ class DescribableTextures(DatasetBase):
             print("fewshot federated dataset")
         else:
             federated_train_x = None
-        super().__init__(train_x=train, federated_train_x=federated_train_x, val=val, test=test)
-
+        # 终极保护：防止底层 Dassl 不认识 federated_train_x 参数导致崩溃
+        try:
+            super().__init__(train_x=train, federated_train_x=federated_train_x, val=val, test=test)
+        except TypeError:
+            self.federated_train_x = federated_train_x
+            super().__init__(train_x=train, val=val, test=test)
     @staticmethod
     def read_and_split_data(image_dir, p_trn=0.5, p_val=0.2, ignored=[], new_cnames=None):
         # The data are supposed to be organized into the following structure
@@ -106,3 +111,27 @@ class DescribableTextures(DatasetBase):
             test.extend(_collate(images[n_train + n_val :], label, category))
 
         return train, val, test
+    def generate_federated_dataset(self, dataset, num_shots=-1, num_users=5, is_iid=True, repeat_rate=1.0):
+        dict_users = {}
+        dataset_list = list(dataset)
+        random.shuffle(dataset_list)
+        chunk_size = len(dataset_list) // num_users
+        for i in range(num_users):
+            dict_users[i] = dataset_list[i*chunk_size : (i+1)*chunk_size]
+        return dict_users
+
+    def generate_federated_fewshot_dataset(self, dataset, num_shots=-1, num_users=5, is_iid=True, repeat_rate=1.0):
+        dict_users = {}
+        tracker = defaultdict(list)
+        for item in dataset:
+            tracker[item.label].append(item)
+            
+        for i in range(num_users):
+            user_data = []
+            for label, items in tracker.items():
+                if len(items) >= num_shots and num_shots > 0:
+                    user_data.extend(random.sample(items, num_shots))
+                else:
+                    user_data.extend(items)
+            dict_users[i] = user_data
+        return dict_users
